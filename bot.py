@@ -3,6 +3,11 @@ import discord
 import os
 import time
 from dotenv import load_dotenv
+import asyncio
+from datetime import datetime
+import whisper
+import requests
+import json
 
 # yt-dlp options for extracting audio
 YTDL_OPTIONS = {
@@ -44,6 +49,11 @@ queue_position = -1
 
 # History of played songs (for /previous command)
 song_history = []
+
+# Recording state
+is_recording = False
+recording_sink = None
+recording_start_time = None
 
 async def play_next(ctx, direction="forward"):
     """Play the next (or previous) song in the queue
@@ -111,6 +121,118 @@ async def play_next(ctx, direction="forward"):
             current_song["start_time"] = None
     
     ctx.voice_client.play(source, after=after_playing)
+    
+async def process_recording(ctx, audio_data, start_time):
+    """Process recorded audio: combine, transcribe, and summarize"""
+    try:
+        from pydub import AudioSegment
+        import io
+        
+        print(f"Processing recording with {len(audio_data)} audio streams")
+        print(f"User IDs in recording: {list(audio_data.keys())}")
+        
+        # Combine all audio streams
+        combined_audio = None
+        for user_id, audio in audio_data.items():
+            print(f"Processing audio from user {user_id}")
+            audio.file.seek(0)
+            # Try to detect format automatically
+            try:
+                audio_segment = AudioSegment.from_file(audio.file, format="mp3")
+            except:
+                audio.file.seek(0)
+                audio_segment = AudioSegment.from_file(audio.file, format="wav")
+            print(f"Audio segment duration: {len(audio_segment)}ms")
+            
+            if combined_audio is None:
+                combined_audio = audio_segment
+            else:
+                # Overlay all voices together
+                combined_audio = combined_audio.overlay(audio_segment)
+        
+        if combined_audio is None:
+            await ctx.send("❌ No audio to process!")
+            return
+        
+        # Save combined audio temporarily
+        timestamp = start_time.strftime("%Y%m%d_%H%M%S")
+        temp_file = f"recording_{timestamp}.mp3"
+        combined_audio.export(temp_file, format="mp3")
+        
+        await ctx.send("🎧 Audio combined. Starting transcription... (this will take a while)")
+
+        # Convert MP3 to WAV for Whisper (it works better with WAV)
+        wav_file = temp_file.replace('.mp3', '.wav')
+        combined_audio.export(wav_file, format="wav")
+        
+        print(f"Exported audio file: {wav_file}")
+        print(f"File size: {os.path.getsize(wav_file)} bytes")
+        
+        # Transcribe using Whisper
+        model = whisper.load_model("base")
+        print("Whisper model loaded, starting transcription...")
+        result = model.transcribe(wav_file)
+        
+        transcript = result["text"]
+        print(f"Transcript length: {len(transcript)} characters")
+        print(f"Transcript preview: {transcript[:200]}")
+        
+        await ctx.send("✅ Transcription complete! Generating summary...")
+        
+        print(f"Sending transcript to Ollama: {transcript}")
+        
+        # Summarize using Ollama
+        summary_prompt = f"""You are summarizing a D&D session transcript. Extract only the KEY EVENTS and DECISIONS.
+
+Transcript:
+{transcript}
+
+Provide a concise summary with:
+1. Major story events that happened
+2. Important decisions the party made
+3. Key NPCs encountered
+4. Loot or rewards obtained
+5. Next session hooks/cliffhangers
+
+Keep it brief - focus only on what matters for continuity."""
+
+        # Call Ollama API
+        response = requests.post(
+            'http://localhost:11434/api/generate',
+            json={
+                'model': 'llama3.2',
+                'prompt': summary_prompt,
+                'stream': False
+            }
+        )
+        
+        summary = response.json()['response']
+        
+        # Format the output
+        session_date = start_time.strftime("%B %d, %Y at %I:%M %p")
+        output = f"""# D&D Session Summary
+**Date:** {session_date}
+
+## Key Events & Decisions
+{summary}
+
+---
+*Full transcript available upon request*
+"""
+        
+        # Send to Discord (we'll add Google Sheets option later)
+        message = await ctx.send(output)
+        await message.pin()
+        
+        await ctx.send("📌 Session summary has been pinned!")
+        
+        # Clean up temp file
+        os.remove(temp_file)
+        os.remove(wav_file)
+        
+    except Exception as e:
+        await ctx.send(f"❌ Error processing recording: {str(e)}")
+        print(f"Processing error: {e}")
 
 @bot.event
 async def on_ready():
@@ -460,6 +582,64 @@ async def nowplaying(ctx):
         )
     else:
         await ctx.respond("Nothing is currently playing!")
+        
+@bot.slash_command(name="startrecording", description="Start recording the voice channel")
+async def startrecording(ctx):
+    global is_recording, recording_sink, recording_start_time
+    
+    if ctx.voice_client is None:
+        await ctx.respond("I need to be in a voice channel to record! Use `/join` first.")
+        return
+    
+    if is_recording:
+        await ctx.respond("Already recording!")
+        return
+    
+    # Try MP3Sink instead of WaveSink
+    recording_sink = discord.sinks.MP3Sink()
+    
+    # Async callback for when recording stops
+    async def finished_callback(sink, *args):
+        print("Recording finished callback triggered")
+    
+    # Start recording
+    ctx.voice_client.start_recording(
+        recording_sink,
+        finished_callback,
+        ctx
+    )
+    
+    is_recording = True
+    recording_start_time = datetime.now()
+    
+    await ctx.respond("🔴 **Recording started!** Use `/stoprecording` when done.")
+    print(f"Recording started at {recording_start_time}")
+    
+@bot.slash_command(name="stoprecording", description="Stop recording and process the audio")
+async def stoprecording(ctx):
+    global is_recording, recording_sink, recording_start_time
+    
+    if not is_recording:
+        await ctx.respond("Not currently recording!")
+        return
+    
+    await ctx.respond("⏹️ Stopping recording... Please wait while I process the audio.")
+    
+    # Stop recording
+    ctx.voice_client.stop_recording()
+    is_recording = False
+    
+    # Get the recorded audio files
+    audio_data = recording_sink.audio_data
+    
+    if not audio_data:
+        await ctx.respond("❌ No audio was recorded!")
+        return
+    
+    await ctx.respond(f"📝 Processing audio from {len(audio_data)} speaker(s)... This may take a few minutes.")
+    
+    # Process the recording in a separate thread to avoid blocking
+    asyncio.create_task(process_recording(ctx, audio_data, recording_start_time))
 
 # Run the bot
 bot.run(TOKEN)
