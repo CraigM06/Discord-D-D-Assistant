@@ -178,20 +178,37 @@ async def process_recording(ctx, audio_data, start_time):
         print(f"Transcript preview: {transcript[:200]}")
         
         await ctx.send("✅ Transcription complete! Generating summary...")
-        
+
         print(f"Sending transcript to Ollama: {transcript}")
+        
+        # Load character mappings from active campaign
+        filename = f"campaign_{active_character_map}.json"
+        try:
+            with open(filename, "r") as f:
+                char_map = json.load(f)
+            
+            # Create character context for the AI
+            char_context = "Character Names:\n"
+            for user_id, info in char_map.items():
+                char_context += f"- {info['character_info']}\n"
+        except FileNotFoundError:
+            char_context = "No character information available."
         
         # Summarize using Ollama
         summary_prompt = f"""You are summarizing a D&D session transcript. Extract only the KEY EVENTS and DECISIONS.
 
+{char_context}
+
 Transcript:
 {transcript}
 
+When summarizing, use the character names provided above instead of generic terms like "the party" or "someone". 
+
 Provide a concise summary with:
 1. Major story events that happened
-2. Important decisions the party made
+2. Important decisions the party made (mention which characters made key decisions)
 3. Key NPCs encountered
-4. Loot or rewards obtained
+4. Loot or rewards obtained (mention who got what if specified)
 5. Next session hooks/cliffhangers
 
 Keep it brief - focus only on what matters for continuity."""
@@ -233,6 +250,144 @@ Keep it brief - focus only on what matters for continuity."""
     except Exception as e:
         await ctx.send(f"❌ Error processing recording: {str(e)}")
         print(f"Processing error: {e}")
+        
+# Global variable to track active character map
+active_character_map = "default"
+
+@bot.slash_command(name="createcampaign", description="Create a new campaign character mapping")
+async def createcampaign(ctx, campaign_name: str):
+    """Create a new character mapping file for a campaign"""
+    
+    filename = f"campaign_{campaign_name}.json"
+    
+    # Check if it already exists
+    if os.path.exists(filename):
+        await ctx.respond(f"❌ Campaign '{campaign_name}' already exists! Use `/loadcampaign` to switch to it.")
+        return
+    
+    # Create empty mapping file
+    with open(filename, "w") as f:
+        json.dump({}, f, indent=2)
+    
+    await ctx.respond(f"✅ **Campaign created:** {campaign_name}\n"
+                     f"Use `/loadcampaign {campaign_name}` to activate it, then `/addcharacter` to add players.")
+
+@bot.slash_command(name="loadcampaign", description="Load a campaign's character mappings")
+async def loadcampaign(ctx, campaign_name: str):
+    """Switch to a different campaign's character mappings"""
+    
+    global active_character_map
+    
+    filename = f"campaign_{campaign_name}.json"
+    
+    if not os.path.exists(filename):
+        await ctx.respond(f"❌ Campaign '{campaign_name}' doesn't exist! Use `/createcampaign` to create it.")
+        return
+    
+    active_character_map = campaign_name
+    
+    # Show current characters in this campaign
+    with open(filename, "r") as f:
+        char_map = json.load(f)
+    
+    if char_map:
+        char_list = "\n".join([f"- {info['character_info']}" for info in char_map.values()])
+        await ctx.respond(f"✅ **Loaded campaign:** {campaign_name}\n\n**Characters:**\n{char_list}")
+    else:
+        await ctx.respond(f"✅ **Loaded campaign:** {campaign_name}\n\n*(No characters added yet)*")
+
+@bot.slash_command(name="listcampaigns", description="Show all available campaigns")
+async def listcampaigns(ctx):
+    """List all campaign files"""
+    
+    campaign_files = [f for f in os.listdir('.') if f.startswith('campaign_') and f.endswith('.json')]
+    
+    if not campaign_files:
+        await ctx.respond("No campaigns created yet! Use `/createcampaign` to create one.")
+        return
+    
+    campaigns = [f.replace('campaign_', '').replace('.json', '') for f in campaign_files]
+    current_marker = " ← **ACTIVE**" if active_character_map in campaigns else ""
+    
+    campaign_list = "\n".join([f"• {c}{current_marker if c == active_character_map else ''}" for c in campaigns])
+    
+    await ctx.respond(f"📋 **Available Campaigns:**\n{campaign_list}\n\n"
+                     f"Current: **{active_character_map}**\n"
+                     f"Use `/loadcampaign name` to switch.")
+
+@bot.slash_command(name="addcharacter", description="Add a character to the active campaign")
+async def addcharacter(ctx, player: discord.Member, character_info: str):
+    """Map a Discord user to their character name in the active campaign"""
+    
+    filename = f"campaign_{active_character_map}.json"
+    
+    # Load existing mappings
+    try:
+        with open(filename, "r") as f:
+            char_map = json.load(f)
+    except FileNotFoundError:
+        await ctx.respond(f"❌ No campaign loaded! Use `/createcampaign` or `/loadcampaign` first.")
+        return
+    
+    # Add new mapping
+    char_map[str(player.id)] = {
+        "discord_name": player.display_name,
+        "character_info": character_info
+    }
+    
+    # Save mappings
+    with open(filename, "w") as f:
+        json.dump(char_map, f, indent=2)
+    
+    await ctx.respond(f"✅ **Character added to '{active_character_map}':**\n"
+                     f"{player.display_name} → {character_info}")
+
+@bot.slash_command(name="showcharacters", description="Show characters in the active campaign")
+async def showcharacters(ctx):
+    """Display all character mappings for the active campaign"""
+    
+    filename = f"campaign_{active_character_map}.json"
+    
+    try:
+        with open(filename, "r") as f:
+            char_map = json.load(f)
+        
+        if not char_map:
+            await ctx.respond(f"No characters in campaign '{active_character_map}' yet! Use `/addcharacter` to add players.")
+            return
+        
+        message = f"👥 **Party Roster** (Campaign: {active_character_map}):\n\n"
+        for user_id, info in char_map.items():
+            message += f"**{info['character_info']}**\n└ Played by: {info['discord_name']}\n\n"
+        
+        await ctx.respond(message)
+        
+    except FileNotFoundError:
+        await ctx.respond(f"❌ Campaign '{active_character_map}' not found! Use `/createcampaign` first.")
+
+@bot.slash_command(name="removecharacter", description="Remove a character from the active campaign")
+async def removecharacter(ctx, player: discord.Member):
+    """Remove a player's character mapping from the active campaign"""
+    
+    filename = f"campaign_{active_character_map}.json"
+    
+    try:
+        with open(filename, "r") as f:
+            char_map = json.load(f)
+        
+        user_id = str(player.id)
+        if user_id in char_map:
+            removed = char_map.pop(user_id)
+            
+            with open(filename, "w") as f:
+                json.dump(char_map, f, indent=2)
+            
+            await ctx.respond(f"✅ Removed from '{active_character_map}': {removed['character_info']}")
+        else:
+            await ctx.respond(f"No character found for {player.display_name} in campaign '{active_character_map}'")
+            
+    except FileNotFoundError:
+        await ctx.respond(f"❌ Campaign '{active_character_map}' not found!")
 
 @bot.event
 async def on_ready():
